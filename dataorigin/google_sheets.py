@@ -378,7 +378,7 @@ def upsert_google_sheet(
                 },
                 "cell": {
                     "userEnteredFormat": {
-                        "backgroundColor": {"red": 1.0, "green": 0.92, "blue": 0.0},
+                        "backgroundColor": {"red": 1.0, "green": 0.949, "blue": 0.8},
                         "textFormat": {"bold": True},
                         "horizontalAlignment": "CENTER"
                     }
