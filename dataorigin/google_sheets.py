@@ -416,17 +416,41 @@ def upsert_google_sheet(
                 "fields": "userEnteredFormat.wrapStrategy"
             }
         },
-        # 5. Reducir el tamaño de las columnas (a partir de la tercera) a la mitad
+        # 5. Establecer altura uniforme para todas las filas usadas
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 0,
+                    "endIndex": df.shape[0] + 1  # header + data rows
+                },
+                "properties": {"pixelSize": 28},
+                "fields": "pixelSize"
+            }
+        },
+        # 6. Establecer ancho máximo uniforme de 200 px para todas las columnas excepto la primera
         {
             "updateDimensionProperties": {
                 "range": {
                     "sheetId": sheet_id,
                     "dimension": "COLUMNS",
-                    "startIndex": 2, # A partir de la tercera columna (índice 2)
-                    "endIndex": df.shape[1] # Hasta la última columna
+                    "startIndex": 1,
+                    "endIndex": df.shape[1]
                 },
                 "properties": {"pixelSize": 200},
                 "fields": "pixelSize"
+            }
+        },
+        # 7. Autoajustar solo la primera columna según su contenido
+        {
+            "autoResizeDimensions": {
+                "dimensions": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 0,
+                    "endIndex": 1
+                }
             }
         }
     ]
