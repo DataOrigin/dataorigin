@@ -364,9 +364,9 @@ def upsert_google_sheet(
             body=rename_request
         ).execute())
 
-    # Aplicar formato después de subir y renombrar
+    # Aplicar formato después de subir y renombrar (sin "table mode")
     format_requests = [
-        # 1. Primera fila (encabezados) con fondo amarillo, negrita y texto centrado
+        # 1. Primera fila (encabezados) con color #fff2cc, negrita y texto centrado
         {
             "repeatCell": {
                 "range": {
@@ -386,7 +386,7 @@ def upsert_google_sheet(
                 "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat,userEnteredFormat.horizontalAlignment"
             }
         },
-        # 2. Congelar las dos primeras columnas
+        # 2. Congelar la primera fila y las dos primeras columnas
         {
             "updateSheetProperties": {
                 "properties": {
@@ -408,7 +408,7 @@ def upsert_google_sheet(
                 "innerVertical": {"style": "SOLID", "width": 1}
             }
         },
-        # 4. Ajustar texto automáticamente para todas las celdas
+        # 4. Forzar CLIP para que el texto que no quepa no desborde ni haga wrap
         {
             "repeatCell": {
                 "range": {"sheetId": sheet_id},
@@ -416,20 +416,7 @@ def upsert_google_sheet(
                 "fields": "userEnteredFormat.wrapStrategy"
             }
         },
-        # 5. Establecer altura uniforme para todas las filas usadas
-        {
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "dimension": "ROWS",
-                    "startIndex": 0,
-                    "endIndex": df.shape[0] + 1  # header + data rows
-                },
-                "properties": {"pixelSize": 28},
-                "fields": "pixelSize"
-            }
-        },
-        # 6. Establecer ancho máximo uniforme de 200 px para todas las columnas excepto la primera
+        # 5. Establecer ancho máximo uniforme de 200 px para todas las columnas excepto la primera
         {
             "updateDimensionProperties": {
                 "range": {
@@ -442,7 +429,7 @@ def upsert_google_sheet(
                 "fields": "pixelSize"
             }
         },
-        # 7. Autoajustar solo la primera columna según su contenido
+        # 6. Autoajustar solo la primera columna según su contenido
         {
             "autoResizeDimensions": {
                 "dimensions": {
@@ -452,7 +439,8 @@ def upsert_google_sheet(
                     "endIndex": 1
                 }
             }
-        }
+        },
+        
     ]
 
     # Ejecutar las solicitudes de formato
@@ -497,7 +485,7 @@ def read_google_sheet(
     first_sheet_name = "Sheet1"
     if meta and "sheets" in meta and len(meta["sheets"]) > 0:
         first_sheet_name = meta["sheets"][0]["properties"]["title"]
-    print(f"[DEBUG] Nombre de la primera hoja detectada: {first_sheet_name}") # Reintroducir línea de depuración
+    logger.debug("Detected first sheet name: %s", first_sheet_name)  # debug only
 
     # Rango de la hoja, asumiendo que los datos empiezan en A1
     range_name = f"{first_sheet_name}" # Lee toda la hoja
@@ -507,7 +495,7 @@ def read_google_sheet(
         range=range_name,
         valueRenderOption=value_render_option
     ).execute())
-    print(f"[DEBUG] Resultado de la API Sheets.values().get: {result}") # Reintroducir línea de depuración
+    logger.debug("Sheets.values().get result: %s", result)  # debug only
 
     values = result.get('values', [])
     if not values:
