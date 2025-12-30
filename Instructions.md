@@ -137,3 +137,15 @@ Cuando se te solicite:
 Si la subida es exitosa, tu paquete actualizado estará disponible en PyPI.
 
 ---
+
+### 6. Limpiar libreria anterior y añadir nueva version
+
+```bash
+python -m pip uninstall -y dataorigin
+python -m pip install dataorigin==1.6.3
+```
+
+```bash
+python -m pip show dataorigin
+python -c "import dataorigin, importlib.metadata as m; print(dataorigin.__file__); print(dataorigin.__version__, m.version('dataorigin'))"
+```
