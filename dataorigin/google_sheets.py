@@ -1,5 +1,6 @@
-import os, json, time, logging
+import os, json, time, logging, re
 from typing import Optional, Tuple, List, Dict
+from urllib.parse import urlparse, parse_qs
 import datetime  # Needed for timestamp-based sheet names
 
 import pandas as pd
@@ -13,6 +14,41 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 # Scopes necesarios para acceder a Google Drive y Sheets
 SCOPES = ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/spreadsheets"]
 logger = logging.getLogger(__name__)
+
+_SPREADSHEET_ID_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9-_]+)")
+
+def _parse_spreadsheet_url(spreadsheet_url: str) -> Tuple[str, Optional[int]]:
+    if not spreadsheet_url or not isinstance(spreadsheet_url, str): raise ValueError("spreadsheet_url must be a non-empty string")
+    parsed = urlparse(spreadsheet_url)
+    match = _SPREADSHEET_ID_RE.search(parsed.path) or _SPREADSHEET_ID_RE.search(spreadsheet_url)
+    if not match: raise ValueError("Invalid spreadsheet_url (missing /spreadsheets/d/<spreadsheet_id>)")
+    spreadsheet_id = match.group(1)
+    gid_str = None
+    query = parse_qs(parsed.query or "")
+    if query.get("gid"): gid_str = (query.get("gid") or [None])[0]
+    if not gid_str and parsed.fragment:
+        fragment = parsed.fragment.lstrip("#")
+        frag_qs = parse_qs(fragment)
+        if frag_qs.get("gid"): gid_str = (frag_qs.get("gid") or [None])[0]
+    if not gid_str: return spreadsheet_id, None
+    try: gid = int(gid_str)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError("Invalid gid in spreadsheet_url (must be an integer)") from e
+    return spreadsheet_id, gid
+
+def _get_sheet_title_by_gid(sheets, spreadsheet_id: str, gid: int) -> Optional[str]:
+    meta = _retry(lambda: sheets.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)").execute())
+    for s in meta.get("sheets", []):
+        p = s.get("properties", {})
+        sheet_id = p.get("sheetId")
+        if sheet_id is None: 
+            continue
+        try:
+            if int(sheet_id) == int(gid): 
+                return p.get("title")
+        except Exception:
+            continue
+    return None
 
 def _load_credentials(scopes: List[str] = SCOPES):
     """
@@ -282,7 +318,8 @@ def upsert_google_sheet(
     clear: bool = True,
     value_input_option: str = "USER_ENTERED",
     rename_sheet: bool = True,
-    rename_sheet_to: Optional[str] = None
+    rename_sheet_to: Optional[str] = None,
+    spreadsheet_url: Optional[str] = None
 ) -> Dict[str, str]:
     """
     Función principal para subir o actualizar un DataFrame en Google Sheets.
@@ -327,6 +364,20 @@ def upsert_google_sheet(
     if df is None or not isinstance(df, pd.DataFrame): 
         return {"status": "400 Bad Request", "message": "df must be a pandas.DataFrame"}
     
+    parsed_spreadsheet_id = None
+    parsed_sheet_gid: Optional[int] = None
+    if spreadsheet_url:
+        try:
+            parsed_spreadsheet_id, parsed_sheet_gid = _parse_spreadsheet_url(spreadsheet_url)
+        except Exception as e:  # noqa: BLE001
+            return {"status": "400 Bad Request", "message": str(e)}
+
+    if spreadsheet_id and parsed_spreadsheet_id and spreadsheet_id != parsed_spreadsheet_id:
+        return {"status": "400 Bad Request", "message": "spreadsheet_id does not match spreadsheet_url"}
+
+    if not spreadsheet_id and parsed_spreadsheet_id: 
+        spreadsheet_id = parsed_spreadsheet_id
+
     if not spreadsheet_id and not spreadsheet_title: 
         return {"status": "400 Bad Request", "message": "Provide spreadsheet_id or spreadsheet_title"}
     
@@ -347,6 +398,12 @@ def upsert_google_sheet(
     if sheet_name:
         sheet_id = _ensure_sheet_exists(sheets, doc["id"], sheet_name)
         current_sheet_name = sheet_name
+    elif parsed_sheet_gid is not None:
+        target_sheet_name = _get_sheet_title_by_gid(sheets, doc["id"], parsed_sheet_gid)
+        if not target_sheet_name: 
+            return {"status": "404 Not Found", "message": f"Sheet gid {parsed_sheet_gid} not found in spreadsheet"}
+        sheet_id = int(parsed_sheet_gid)
+        current_sheet_name = target_sheet_name
     else:
         first_sheet_properties = meta["sheets"][0]["properties"]
         sheet_id = first_sheet_properties["sheetId"]
@@ -470,40 +527,62 @@ def upsert_google_sheet(
     }
 
 def read_google_sheet(
-    spreadsheet_id: str,
-    # Eliminar sheet_name de los parámetros
+    spreadsheet_id: Optional[str] = None,
+    spreadsheet_url: Optional[str] = None,
+    sheet_name: Optional[str] = None,
     value_render_option: str = "FORMATTED_VALUE"  # RAW, FORMATTED_VALUE, UNFORMATTED_VALUE
-) -> List[Dict]: # Cambiar el tipo de retorno a List[Dict]
+) -> pd.DataFrame:
     """
-    Lee datos de Google Sheets de la PRIMERA HOJA y los devuelve como una lista de diccionarios.
+    Lee datos de Google Sheets y los devuelve como un DataFrame.
+    Si no se indica hoja, lee la primera hoja. Si `spreadsheet_url` incluye `gid`, lee esa hoja.
 
     Args:
         spreadsheet_id: ID del spreadsheet de Google.
+        spreadsheet_url: URL completa del spreadsheet (opcional). Puede incluir gid.
+        sheet_name: Nombre explícito de la hoja (tiene prioridad sobre gid).
         value_render_option: Cómo renderizar los valores.
                              "FORMATTED_VALUE" (defecto), "RAW", "UNFORMATTED_VALUE".
 
     Returns:
-        Lista de diccionarios, donde cada diccionario representa una fila y
-        las claves son los nombres de las columnas.
+        DataFrame con encabezados detectados en la primera fila.
     """
     sheets, _ = _build_services()
 
-    # Obtener metadatos del spreadsheet para encontrar el nombre de la primera hoja
-    meta = _retry(lambda: sheets.spreadsheets().get(
-        spreadsheetId=spreadsheet_id,
-        fields="sheets.properties.title"
-    ).execute())
+    parsed_spreadsheet_id = None
+    parsed_sheet_gid: Optional[int] = None
+    if spreadsheet_url:
+        parsed_spreadsheet_id, parsed_sheet_gid = _parse_spreadsheet_url(spreadsheet_url)
 
-    first_sheet_name = "Sheet1"
-    if meta and "sheets" in meta and len(meta["sheets"]) > 0:
-        first_sheet_name = meta["sheets"][0]["properties"]["title"]
-    logger.debug("Detected first sheet name: %s", first_sheet_name)  # debug only
+    if spreadsheet_id and parsed_spreadsheet_id and spreadsheet_id != parsed_spreadsheet_id:
+        raise ValueError("spreadsheet_id does not match spreadsheet_url")
+
+    effective_spreadsheet_id = spreadsheet_id or parsed_spreadsheet_id
+    if not effective_spreadsheet_id: 
+        raise ValueError("Provide spreadsheet_id or spreadsheet_url")
+
+    target_sheet_name = sheet_name
+    if not target_sheet_name and parsed_sheet_gid is not None:
+        target_sheet_name = _get_sheet_title_by_gid(sheets, effective_spreadsheet_id, parsed_sheet_gid)
+        if not target_sheet_name: 
+            raise ValueError(f"Sheet gid {parsed_sheet_gid} not found in spreadsheet")
+
+    if not target_sheet_name:
+        # Obtener metadatos del spreadsheet para encontrar el nombre de la primera hoja
+        meta = _retry(lambda: sheets.spreadsheets().get(
+            spreadsheetId=effective_spreadsheet_id,
+            fields="sheets.properties.title"
+        ).execute())
+
+        target_sheet_name = "Sheet1"
+        if meta and "sheets" in meta and len(meta["sheets"]) > 0:
+            target_sheet_name = meta["sheets"][0]["properties"]["title"]
+        logger.debug("Detected first sheet name: %s", target_sheet_name)  # debug only
 
     # Rango de la hoja, asumiendo que los datos empiezan en A1
-    range_name = f"{first_sheet_name}" # Lee toda la hoja
+    range_name = f"{target_sheet_name}" # Lee toda la hoja
 
     result = _retry(lambda: sheets.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
+        spreadsheetId=effective_spreadsheet_id,
         range=range_name,
         valueRenderOption=value_render_option
     ).execute())
@@ -511,18 +590,16 @@ def read_google_sheet(
 
     values = result.get('values', [])
     if not values:
-        return []
+        return pd.DataFrame()
 
     # La primera fila son los encabezados
-    headers = values[0]
-    data = []
+    headers = [str(h) for h in values[0]]
+    rows: List[List] = []
     for row in values[1:]:
-        row_dict = {}
-        for i, header in enumerate(headers):
-            row_dict[header] = row[i] if i < len(row) else ""
-        data.append(row_dict)
-    
-    return data
+        if len(row) < len(headers): row = row + [""] * (len(headers) - len(row))
+        if len(row) > len(headers): row = row[:len(headers)]
+        rows.append(row)
+    return pd.DataFrame(rows, columns=headers)
 
 #Uso de la función upsert_google_sheet
 """
