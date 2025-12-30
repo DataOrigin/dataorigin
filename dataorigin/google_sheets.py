@@ -1,6 +1,6 @@
 import os, json, time, logging
 from typing import Optional, Tuple, List, Dict
-import datetime # Añadir import para datetime
+import datetime  # Needed for timestamp-based sheet names
 
 import pandas as pd
 from google.oauth2 import service_account
@@ -33,8 +33,14 @@ def _load_credentials(scopes: List[str] = SCOPES):
     # Método 1: Service Account desde variable de entorno (JSON string)
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if sa_json:
-        info = json.loads(sa_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        try:
+            info = json.loads(sa_json)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("Invalid GOOGLE_SERVICE_ACCOUNT_JSON (must be a JSON string)") from e
+        try:
+            creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("Failed to load credentials from GOOGLE_SERVICE_ACCOUNT_JSON") from e
         return creds
         
     
@@ -42,13 +48,20 @@ def _load_credentials(scopes: List[str] = SCOPES):
     
     sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if sa_path: 
-        creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
+        try:
+            creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("Failed to load credentials from GOOGLE_APPLICATION_CREDENTIALS") from e
         return creds
     
     # Método 3: OAuth2 flow para autenticación de usuario
     client_secret_file = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET_FILE")
     token_path = os.getenv("GOOGLE_OAUTH_TOKEN_FILE", "token.json")
-    if client_secret_file:
+    oauth_client_id = (os.getenv("OAUTH2_CLIENT_ID") or os.getenv("GOOGLE_OAUTH_CLIENT_ID") or "").strip()
+    oauth_client_secret = (os.getenv("OAUTH2_CLIENT_SECRET") or os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip()
+    has_oauth_env = bool(oauth_client_id and oauth_client_secret)
+
+    if client_secret_file or has_oauth_env:
         creds: Optional[UserCredentials] = None
         
         # Intentar cargar token existente
@@ -68,7 +81,19 @@ def _load_credentials(scopes: List[str] = SCOPES):
             
             # Si no se puede refrescar, iniciar nuevo flow OAuth
             if not creds:
-                flow = InstalledAppFlow.from_client_secrets_file(client_secret_file, scopes=scopes)
+                if client_secret_file:
+                    flow = InstalledAppFlow.from_client_secrets_file(client_secret_file, scopes=scopes)
+                else:
+                    client_config = {
+                        "installed": {
+                            "client_id": oauth_client_id,
+                            "client_secret": oauth_client_secret,
+                            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                            "token_uri": "https://oauth2.googleapis.com/token",
+                            "redirect_uris": ["http://localhost"],
+                        }
+                    }
+                    flow = InstalledAppFlow.from_client_config(client_config, scopes=scopes)
                 creds = flow.run_local_server(port=int(os.getenv("GOOGLE_OAUTH_PORT", "0")))
             
             # Guardar token para uso futuro
@@ -76,11 +101,11 @@ def _load_credentials(scopes: List[str] = SCOPES):
                 with open(token_path, "w", encoding="utf-8") as f: 
                     f.write(creds.to_json())
             except Exception: 
-                pass
+                logger.warning("Failed to persist OAuth token to %s", token_path)
         
         return creds
     
-    raise RuntimeError("Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_OAUTH_CLIENT_SECRET_FILE")
+    raise RuntimeError("Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_OAUTH_CLIENT_SECRET_FILE or OAUTH2_CLIENT_ID/OAUTH2_CLIENT_SECRET")
 
 def _build_services(scopes: List[str] = SCOPES):
     """
@@ -251,17 +276,20 @@ def _ensure_sheet_exists(sheets, spreadsheet_id: str, sheet_name: str) -> int:
 def upsert_google_sheet(
     df: pd.DataFrame,
     spreadsheet_title: Optional[str] = None,
-    sheet_name: Optional[str] = None, # Este parámetro será ignorado, siempre se usará la primera hoja
+    sheet_name: Optional[str] = None,
     folder_id: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
     clear: bool = True,
-    value_input_option: str = "USER_ENTERED"
+    value_input_option: str = "USER_ENTERED",
+    rename_sheet: bool = True,
+    rename_sheet_to: Optional[str] = None
 ) -> Dict[str, str]:
     """
     Función principal para subir o actualizar un DataFrame en Google Sheets.
-    Siempre selecciona la primera hoja del spreadsheet para las operaciones de escritura.
-    Siempre borra la hoja existente antes de subir los datos si `clear` es True.
-    Después de subir los datos, la primera hoja será renombrada a la marca de tiempo actual.
+    Si `sheet_name` se proporciona, se usará esa hoja (creándola si no existe). Si no,
+    se usará la primera hoja del spreadsheet.
+    Si `clear` es True, se limpia la hoja antes de subir los datos.
+    Si `rename_sheet` es True, la hoja se renombra (por defecto a una marca de tiempo).
     
     Esta función:
     1. Valida los parámetros de entrada
@@ -275,18 +303,20 @@ def upsert_google_sheet(
     Args:
         df: DataFrame de pandas con los datos a subir
         spreadsheet_title: Título del spreadsheet (opcional si se usa spreadsheet_id)
-        sheet_name: Nombre de la hoja dentro del spreadsheet (ignorado, siempre se usa la primera hoja para la operación).
+        sheet_name: Nombre de la hoja dentro del spreadsheet (si no existe, se crea).
         folder_id: ID de carpeta en Google Drive donde crear el spreadsheet (opcional)
         spreadsheet_id: ID de spreadsheet existente (opcional si se usa spreadsheet_title)
         clear: Si limpiar la hoja antes de subir datos (default: True)
         value_input_option: "RAW" para valores literales o "USER_ENTERED" para interpretación (default: "USER_ENTERED")
+        rename_sheet: Si renombrar la hoja tras escribir (default: True)
+        rename_sheet_to: Nombre explícito para el renombrado (opcional)
         
     Returns:
         Diccionario con resultado de la operación:
         - status: Código de estado HTTP
         - message: Mensaje descriptivo
         - spreadsheet_id: ID del spreadsheet usado
-        - sheet_name: Nuevo nombre de la hoja (marca de tiempo)
+        - sheet_name: Nombre final de la hoja (si se renombra, será el nuevo nombre)
         - url: URL del spreadsheet (si está disponible)
         
     Raises:
@@ -306,25 +336,21 @@ def upsert_google_sheet(
     # Asegurar que existe el spreadsheet
     doc = _ensure_spreadsheet(sheets, drive, spreadsheet_title, spreadsheet_id, folder_id)
     
-    # Obtener el ID y nombre de la primera hoja del spreadsheet
-    meta = _retry(lambda: sheets.spreadsheets().get(
-        spreadsheetId=doc["id"],
-        fields="sheets.properties.sheetId,sheets.properties.title"
-    ).execute())
-    
-    if not meta.get("sheets") or len(meta["sheets"]) == 0:
-        # Si no hay hojas, crear una por defecto (similar a _ensure_sheet_exists)
+    # Ensure there is at least one sheet
+    meta = _retry(lambda: sheets.spreadsheets().get(spreadsheetId=doc["id"], fields="sheets.properties.sheetId,sheets.properties.title").execute())
+    if not meta.get("sheets"):
         _ensure_sheet_exists(sheets, doc["id"], "Sheet1")
-        meta = _retry(lambda: sheets.spreadsheets().get(
-            spreadsheetId=doc["id"],
-            fields="sheets.properties.sheetId,sheets.properties.title"
-        ).execute())
-        if not meta.get("sheets") or len(meta["sheets"]) == 0: # Fallback si sigue sin hojas
-            raise RuntimeError("No se pudo asegurar una hoja en el spreadsheet.")
+        meta = _retry(lambda: sheets.spreadsheets().get(spreadsheetId=doc["id"], fields="sheets.properties.sheetId,sheets.properties.title").execute())
+        if not meta.get("sheets"):
+            raise RuntimeError("Failed to ensure at least one sheet in the spreadsheet")
 
-    first_sheet_properties = meta["sheets"][0]["properties"]
-    sheet_id = first_sheet_properties["sheetId"]
-    current_sheet_name = first_sheet_properties["title"] # Guardar el nombre actual para las operaciones
+    if sheet_name:
+        sheet_id = _ensure_sheet_exists(sheets, doc["id"], sheet_name)
+        current_sheet_name = sheet_name
+    else:
+        first_sheet_properties = meta["sheets"][0]["properties"]
+        sheet_id = first_sheet_properties["sheetId"]
+        current_sheet_name = first_sheet_properties["title"]
 
     # Limpiar hoja si se solicita
     if clear: 
@@ -338,31 +364,17 @@ def upsert_google_sheet(
     _retry(lambda: sheets.spreadsheets().values().update(
         spreadsheetId=doc["id"], 
         range=f"{current_sheet_name}!A1", # Usar el nombre actual para la subida inicial
-        valueInputOption="RAW", 
+        valueInputOption=value_input_option, 
         body=body
     ).execute())
     
-    # Renombrar la hoja a la marca de tiempo actual después de la subida
-    new_sheet_name = datetime.datetime.now().isoformat(sep=" ", timespec="seconds")
-    
-    if current_sheet_name != new_sheet_name: # Solo renombrar si es diferente
-        rename_request = {
-            "requests": [
-                {
-                    "updateSheetProperties": {
-                        "properties": {
-                            "sheetId": sheet_id,
-                            "title": new_sheet_name
-                        },
-                        "fields": "title"
-                    }
-                }
-            ]
-        }
-        _retry(lambda: sheets.spreadsheets().batchUpdate(
-            spreadsheetId=doc["id"],
-            body=rename_request
-        ).execute())
+    # Rename sheet after upload (optional)
+    new_sheet_name = current_sheet_name
+    if rename_sheet:
+        new_sheet_name = rename_sheet_to or datetime.datetime.now().isoformat(sep=" ", timespec="seconds")
+        if current_sheet_name != new_sheet_name:
+            rename_request = {"requests": [{"updateSheetProperties": {"properties": {"sheetId": sheet_id, "title": new_sheet_name}, "fields": "title"}}]}
+            _retry(lambda: sheets.spreadsheets().batchUpdate(spreadsheetId=doc["id"], body=rename_request).execute())
 
     # Aplicar formato después de subir y renombrar (sin "table mode")
     format_requests = [
@@ -538,7 +550,7 @@ from modules.google_sheets import read_google_sheet
 
 # Asegúrate de usar un spreadsheet_id válido y compartido con la Service Account
 # spreadsheet_id = os.getenv("SPREADSHEET_ID", "TU_SPREADSHEET_ID_AQUI") # Reemplaza con tu ID real
-spreadsheet_id = "1GiwVpTRjiN1EOYNlYnLXSgNVjwuHCEswcbcxlZU7EVY" # Ejemplo de ID
+spreadsheet_id = "YOUR_SPREADSHEET_ID" # Example spreadsheet id
 
 # La función read_google_sheet ya no imprime directamente, solo devuelve los datos
 read_data = read_google_sheet(

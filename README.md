@@ -12,31 +12,35 @@ pip install dataorigin
 
 ## Usage
 
-Example usage for `google_sheets.py` (assuming you have configured credentials):
+Example usage for `google_sheets.py` (assuming you have configured credentials using environment variables):
+
+- `GOOGLE_SERVICE_ACCOUNT_JSON`: full Service Account JSON as a string (recommended for containers)
+- `GOOGLE_APPLICATION_CREDENTIALS`: absolute path to Service Account JSON
+- `GOOGLE_OAUTH_CLIENT_SECRET_FILE`: path to OAuth client secret file (interactive, local dev)
+- `GOOGLE_OAUTH_TOKEN_FILE`: where to persist OAuth token (default: `token.json`)
+- `GOOGLE_OAUTH_PORT`: OAuth local server port (default: `0`)
 
 ```python
-from dataorigin.google_sheets import GoogleSheetsConnector
-
-# Initialize the connector (requires GOOGLE_SHEETS_CREDENTIALS_PATH environment variable)
-connector = GoogleSheetsConnector()
-
-# Example: Read data from a spreadsheet
-spreadsheet_id = "YOUR_SPREADSHEET_ID"
-data = connector.read_sheet_data(spreadsheet_id)
-print(data)
+import os
+import pandas as pd
+from dataorigin.google_sheets import upsert_google_sheet, read_google_sheet
 
 # Example: Write data to a spreadsheet
-# Los datos se deben presentar en formato DataFrame de pandas
 df = pd.DataFrame([{"a": 1, "b": 2}, {"a": 3, "b": 4}])
 
 res = upsert_google_sheet(
     df=df,
-    spreadsheet_id="YOUR_SPREADSHEET_ID",           # o usa spreadsheet_nombre="..."
-    sheet_name="data", # Crea o modifica la hoja
-    folder_id=os.getenv("GDRIVE_FOLDER_ID"), # OPCIONAL
+    spreadsheet_id="YOUR_SPREADSHEET_ID",           # or use spreadsheet_title="..."
+    sheet_name="data",                              # optional: target sheet (created if missing)
+    folder_id=os.getenv("GDRIVE_FOLDER_ID"),         # optional
     clear=True,
-    value_input_option="USER_ENTERED"              # RAW o USER_ENTERED
+    value_input_option="USER_ENTERED",              # "RAW" or "USER_ENTERED"
+    rename_sheet=False
 )
+
+# Example: Read data from a spreadsheet (reads the first sheet by default)
+data = read_google_sheet(spreadsheet_id="YOUR_SPREADSHEET_ID")
+print(data)
 ```
 
 ## License
