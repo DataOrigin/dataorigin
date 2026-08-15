@@ -43,6 +43,30 @@ data = read_google_sheet(spreadsheet_id="YOUR_SPREADSHEET_ID")
 print(data)
 ```
 
+### Low-level Google Sheets helpers
+
+`dataorigin.google_sheets` also exposes the lower-level building blocks used
+internally by `upsert_google_sheet`/`read_google_sheet`, for callers that need
+finer control (large uploads, grid resizing, tab discovery from a URL):
+
+- `normalize_spreadsheet_id(value)` — extract a spreadsheet id from a URL, or pass a bare id through.
+- `get_spreadsheet_id_sheet_id_and_title(sheets, spreadsheet_url)` — resolve a URL (with optional `gid`) to `(spreadsheet_id, sheet_id, title, row_count)`.
+- `ensure_sheet_has_rows(sheets, spreadsheet_id, sheet_id, min_rows, grow_by_rows=5000)` — grow a sheet's row count when it's below `min_rows`.
+- `set_sheet_row_count(sheets, spreadsheet_id, sheet_id, row_count)` — set a sheet's row count to an exact value.
+- `trim_sheet_columns(spreadsheet_url, sheet_names=None)` — shrink each tab's grid to its last non-empty header column.
+- `write_sheet_values_in_batches(spreadsheet_url, df, batch_size, value_input_option, empty_rows_buffer=25, logger=None)` — upload a large DataFrame in chunks instead of one request.
+- `apply_spreadsheet_oauth_env(default_token_file="token.json")` — populate the OAuth2 env vars from app-specific `SPREADSHEET_OAUTH2_*` aliases.
+
+```python
+from dataorigin.google_sheets import _build_services, get_spreadsheet_id_sheet_id_and_title, ensure_sheet_has_rows
+
+sheets, _ = _build_services()
+spreadsheet_id, sheet_id, title, row_count = get_spreadsheet_id_sheet_id_and_title(
+    sheets, "https://docs.google.com/spreadsheets/d/YOUR_SPREADSHEET_ID/edit#gid=0"
+)
+ensure_sheet_has_rows(sheets, spreadsheet_id, sheet_id, min_rows=10000)
+```
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0 - see the `LICENSE` file for details.

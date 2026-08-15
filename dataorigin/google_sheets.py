@@ -620,6 +620,296 @@ def read_google_sheet(
         rows.append(row)
     return pd.DataFrame(rows, columns=headers)
 
+def normalize_spreadsheet_id(value: Optional[str]) -> str:
+    """
+    Extract the spreadsheet id from a full Google Sheets URL, or pass a bare id
+    through unchanged. Unlike `_parse_spreadsheet_url`, this never raises: it
+    returns an empty string for falsy input, and the trimmed input itself when no
+    `/spreadsheets/d/<id>` pattern is found (e.g. `value` is already a bare id).
+
+    Args:
+        value: a spreadsheet URL or a bare spreadsheet id.
+
+    Returns:
+        The extracted spreadsheet id, or "" if `value` is falsy.
+    """
+    if not value:
+        return ""
+    match = _SPREADSHEET_ID_RE.search(value)
+    return match.group(1) if match else value.strip()
+
+def get_spreadsheet_id_sheet_id_and_title(sheets, spreadsheet_url: str) -> Tuple[str, int, str, int]:
+    """
+    Resolve a spreadsheet URL to its id, target sheet id, sheet title and current
+    row count in a single call. If the URL carries a `gid`, that sheet is
+    targeted; otherwise the first sheet in the spreadsheet is used.
+
+    Args:
+        sheets: Sheets API service (from `_build_services`).
+        spreadsheet_url: spreadsheet URL, optionally with a `#gid=...`/`?gid=...` fragment.
+
+    Returns:
+        Tuple of (spreadsheet_id, sheet_id, sheet_title, row_count).
+
+    Raises:
+        RuntimeError: if the spreadsheet has no sheets, the requested gid does not
+            exist, or the target sheet title cannot be resolved.
+    """
+    spreadsheet_id, gid = _parse_spreadsheet_url(spreadsheet_url)
+    meta = _retry(lambda: sheets.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets.properties(sheetId,title,gridProperties.rowCount)",
+    ).execute())
+    sheets_list = meta.get("sheets") or []
+    if not sheets_list:
+        raise RuntimeError("No sheets found in spreadsheet")
+    if gid is not None:
+        for s in sheets_list:
+            p = s.get("properties") or {}
+            try:
+                if int(p.get("sheetId")) == int(gid):
+                    return (
+                        spreadsheet_id,
+                        int(p.get("sheetId")),
+                        p.get("title") or "",
+                        int((p.get("gridProperties") or {}).get("rowCount") or 0),
+                    )
+            except Exception:
+                continue
+        raise RuntimeError(f"Sheet gid {gid} not found in spreadsheet")
+    first_props = sheets_list[0].get("properties") or {}
+    sheet_id = int(first_props.get("sheetId"))
+    title = first_props.get("title") or ""
+    row_count = int((first_props.get("gridProperties") or {}).get("rowCount") or 0)
+    if not title:
+        raise RuntimeError("Could not resolve target sheet title")
+    return spreadsheet_id, sheet_id, title, row_count
+
+def _get_sheet_row_count(sheets, spreadsheet_id: str, sheet_id: int) -> int:
+    """Internal: current `gridProperties.rowCount` of `sheet_id`, or 0 if not found."""
+    meta = _retry(lambda: sheets.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets.properties(sheetId,gridProperties.rowCount)",
+    ).execute())
+    for s in meta.get("sheets") or []:
+        p = s.get("properties") or {}
+        try:
+            if int(p.get("sheetId")) == int(sheet_id):
+                return int((p.get("gridProperties") or {}).get("rowCount") or 0)
+        except Exception:
+            continue
+    return 0
+
+def ensure_sheet_has_rows(sheets, spreadsheet_id: str, sheet_id: int, min_rows: int, grow_by_rows: int = 5000) -> None:
+    """
+    Grow a sheet's row count so it has at least `min_rows` rows, in increments of
+    `grow_by_rows` (the Sheets API only lets you set the whole grid size at once,
+    not append rows one by one). No-op if the sheet already has enough rows.
+
+    Args:
+        sheets: Sheets API service.
+        spreadsheet_id: target spreadsheet id.
+        sheet_id: numeric id of the target sheet (tab).
+        min_rows: minimum number of rows required.
+        grow_by_rows: size of each growth increment (default 5000).
+    """
+    if not min_rows or min_rows <= 0:
+        return
+    if not grow_by_rows or grow_by_rows <= 0:
+        grow_by_rows = 5000
+
+    current = _get_sheet_row_count(sheets, spreadsheet_id, sheet_id)
+    if current >= min_rows:
+        return
+
+    missing = min_rows - current
+    increments = (missing + grow_by_rows - 1) // grow_by_rows
+    new_count = current + increments * grow_by_rows
+    req = {"requests": [{"updateSheetProperties": {
+        "properties": {"sheetId": int(sheet_id), "gridProperties": {"rowCount": int(new_count)}},
+        "fields": "gridProperties.rowCount",
+    }}]}
+    _retry(lambda: sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute())
+
+def set_sheet_row_count(sheets, spreadsheet_id: str, sheet_id: int, row_count: int) -> None:
+    """
+    Set a sheet's row count to exactly `row_count` (grows or shrinks the grid).
+    No-op if `row_count` already matches the current value or is less than 1.
+
+    Args:
+        sheets: Sheets API service.
+        spreadsheet_id: target spreadsheet id.
+        sheet_id: numeric id of the target sheet (tab).
+        row_count: desired row count.
+    """
+    if row_count < 1:
+        return
+
+    current = _get_sheet_row_count(sheets, spreadsheet_id, sheet_id)
+    if current == row_count:
+        return
+
+    req = {"requests": [{"updateSheetProperties": {
+        "properties": {"sheetId": int(sheet_id), "gridProperties": {"rowCount": int(row_count)}},
+        "fields": "gridProperties.rowCount",
+    }}]}
+    _retry(lambda: sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute())
+
+def trim_sheet_columns(spreadsheet_url: str, sheet_names: Optional[List[str]] = None) -> None:
+    """
+    Shrink each tab's grid to its last non-empty header cell, removing surplus
+    blank columns left over from a wider column template (e.g. a scaffold or
+    duplicated sheet that started with more columns than the data actually uses).
+
+    Reads row 1 of each tab and deletes any grid columns beyond the last titled
+    column. `sheet_names` limits which tabs to trim; None trims every tab in the
+    spreadsheet. Tabs with an empty header row are left untouched.
+
+    Args:
+        spreadsheet_url: full spreadsheet URL.
+        sheet_names: optional iterable of tab titles to restrict trimming to.
+    """
+    sheets, _ = _build_services()
+    spreadsheet_id, _gid = _parse_spreadsheet_url(spreadsheet_url)
+    meta = _retry(lambda: sheets.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets.properties(sheetId,title,gridProperties.columnCount)",
+    ).execute())
+    props = [s.get("properties") or {} for s in (meta.get("sheets") or [])]
+    wanted = set(sheet_names) if sheet_names is not None else None
+    targets = [p for p in props if (wanted is None or p.get("title") in wanted)]
+    if not targets:
+        return
+
+    header_ranges = [f"'{p['title']}'!1:1" for p in targets]
+    batch = _retry(lambda: sheets.spreadsheets().values().batchGet(
+        spreadsheetId=spreadsheet_id, ranges=header_ranges,
+    ).execute())
+    value_ranges = batch.get("valueRanges") or []
+    requests = []
+    for p, vr in zip(targets, value_ranges):
+        rows = vr.get("values") or [[]]
+        header = rows[0] if rows else []
+        keep = 0
+        for i, cell in enumerate(header):
+            if str(cell).strip():
+                keep = i + 1
+        cur = int((p.get("gridProperties") or {}).get("columnCount") or 0)
+        if keep >= 1 and cur > keep:
+            requests.append({"deleteDimension": {"range": {
+                "sheetId": p["sheetId"], "dimension": "COLUMNS", "startIndex": keep, "endIndex": cur,
+            }}})
+    if requests:
+        _retry(lambda: sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id, body={"requests": requests}).execute())
+
+def write_sheet_values_in_batches(
+    spreadsheet_url: str,
+    df: pd.DataFrame,
+    batch_size: int,
+    value_input_option: str,
+    *,
+    empty_rows_buffer: int = 25,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """
+    Upload `df` to a spreadsheet in chunks instead of a single request, so
+    individual Sheets API payloads stay small for very large DataFrames.
+
+    The first batch clears the target sheet via `upsert_google_sheet`; the
+    remaining batches are appended with `values().update`, growing the sheet's
+    row count on demand via `ensure_sheet_has_rows`. When done, the sheet's row
+    count is set to `1 + len(df) + empty_rows_buffer` via `set_sheet_row_count`.
+    No-op if `df` is None or empty.
+
+    Args:
+        spreadsheet_url: full spreadsheet URL (the target tab is resolved from it).
+        df: data to upload.
+        batch_size: max rows per request.
+        value_input_option: "RAW" or "USER_ENTERED".
+        empty_rows_buffer: extra blank rows left below the data (default 25).
+        logger: logger used for progress messages (default: this module's logger).
+    """
+    if df is None or df.empty:
+        return
+
+    log = logger or logging.getLogger(__name__)
+    sheets, _ = _build_services()
+    spreadsheet_id, sheet_id, sheet_name, _row_count = get_spreadsheet_id_sheet_id_and_title(sheets, spreadsheet_url)
+
+    total_rows = int(df.shape[0])
+    total_batches = (total_rows + batch_size - 1) // batch_size
+    first_n = min(batch_size, total_rows)
+
+    df_first = df.iloc[:first_n].copy()
+    log.info("upload_batch 1/%d rows=%d (clear sheet)", total_batches, len(df_first))
+    upsert_google_sheet(
+        df=df_first,
+        spreadsheet_url=spreadsheet_url,
+        sheet_name=sheet_name,
+        clear=True,
+        value_input_option=value_input_option,
+        rename_sheet=False,
+    )
+
+    target_rows = 1 + total_rows + empty_rows_buffer
+    if total_batches <= 1:
+        set_sheet_row_count(sheets, spreadsheet_id, sheet_id, target_rows)
+        return
+
+    start_row = 2 + first_n
+    for batch_idx in range(2, total_batches + 1):
+        start_i = (batch_idx - 1) * batch_size
+        end_i = min(batch_idx * batch_size, total_rows)
+        chunk = df.iloc[start_i:end_i]
+        values = chunk.values.tolist()
+        min_rows_needed = start_row + len(values) - 1
+        ensure_sheet_has_rows(sheets, spreadsheet_id, sheet_id, min_rows=min_rows_needed, grow_by_rows=5000)
+        log.info("upload_batch %d/%d rows=%d start_row=%d", batch_idx, total_batches, len(values), start_row)
+        body = {"values": values}
+        rng = f"{sheet_name}!A{start_row}"
+        _retry(lambda: sheets.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=rng,
+            valueInputOption=value_input_option,
+            body=body,
+        ).execute())
+        start_row += len(values)
+
+    set_sheet_row_count(sheets, spreadsheet_id, sheet_id, target_rows)
+
+def apply_spreadsheet_oauth_env(default_token_file: str = "token.json") -> None:
+    """
+    Populate the generic OAuth2 env vars read by `_load_credentials` from
+    app-specific "SPREADSHEET_OAUTH2_*" aliases, and ensure `GOOGLE_OAUTH_TOKEN_FILE`
+    has a sane default. Handy for host apps that already expose their own
+    `SPREADSHEET_OAUTH2_CLIENT_ID` / `SPREADSHEET_OAUTH2_CLIENT_SECRET` config vars
+    and would rather not rename them just to satisfy this library.
+
+    Only ever sets a variable that isn't already set:
+    - `OAUTH2_CLIENT_ID` / `OAUTH2_CLIENT_SECRET`
+    - `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET`
+    - `GOOGLE_OAUTH_TOKEN_FILE` (falls back to `default_token_file`)
+
+    Args:
+        default_token_file: path used for `GOOGLE_OAUTH_TOKEN_FILE` when it is not
+            already set (default: "token.json", matching `_load_credentials`'s own default).
+    """
+    client_id = (os.getenv("SPREADSHEET_OAUTH2_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("SPREADSHEET_OAUTH2_CLIENT_SECRET") or "").strip()
+    if client_id and client_secret:
+        if not (os.getenv("OAUTH2_CLIENT_ID") or "").strip():
+            os.environ["OAUTH2_CLIENT_ID"] = client_id
+        if not (os.getenv("OAUTH2_CLIENT_SECRET") or "").strip():
+            os.environ["OAUTH2_CLIENT_SECRET"] = client_secret
+        if not (os.getenv("GOOGLE_OAUTH_CLIENT_ID") or "").strip():
+            os.environ["GOOGLE_OAUTH_CLIENT_ID"] = client_id
+        if not (os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip():
+            os.environ["GOOGLE_OAUTH_CLIENT_SECRET"] = client_secret
+
+    if not (os.getenv("GOOGLE_OAUTH_TOKEN_FILE") or "").strip():
+        os.environ["GOOGLE_OAUTH_TOKEN_FILE"] = default_token_file
+
 #Uso de la función upsert_google_sheet
 """
 import os
