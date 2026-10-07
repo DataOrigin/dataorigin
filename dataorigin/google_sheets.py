@@ -16,6 +16,18 @@ SCOPES = ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.
 logger = logging.getLogger(__name__)
 
 _SPREADSHEET_ID_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9-_]+)")
+# With USER_ENTERED, Sheets evaluates a cell starting with "=" as a formula, and "+A1",
+# "-B2" or "@x" too. Scraped third-party text must never run as a formula (IMPORTXML
+# exfiltration): such cells get a leading "'" so they stay text. Phones ("+34 ...") and
+# negatives ("-5") start with a digit after the sign and are left alone.
+_FORMULA_PREFIX_RE = re.compile(r"^(=|[+\-@]\s*[^\d\s.,])")
+
+
+def _sheet_safe(value):
+    """Escape a string cell that USER_ENTERED would evaluate as a formula."""
+    if isinstance(value, str) and _FORMULA_PREFIX_RE.match(value):
+        return "'" + value
+    return value
 
 def _parse_spreadsheet_url(spreadsheet_url: str) -> Tuple[str, Optional[int]]:
     if not spreadsheet_url or not isinstance(spreadsheet_url, str): raise ValueError("spreadsheet_url must be a non-empty string")
@@ -180,7 +192,8 @@ def _build_services(scopes: List[str] = SCOPES):
 def _retry(call, retries: int = 3, base: float = 1.0):
     """
     Implementa reintentos con backoff exponencial para llamadas a la API.
-    Reintenta automáticamente en caso de errores 429 (rate limit) y 5xx (server errors).
+    Reintenta automáticamente en caso de errores 429 (rate limit), 5xx (server errors) y
+    timeouts o cortes de conexión.
     
     Args:
         call: Función lambda a ejecutar
@@ -196,6 +209,12 @@ def _retry(call, retries: int = 3, base: float = 1.0):
     for i in range(retries + 1):
         try: 
             return call()
+        except (TimeoutError, ConnectionError):
+            # Socket read timeouts / resets on big payloads are transient too.
+            if i < retries:
+                time.sleep(base * (2 ** i))
+                continue
+            raise
         except HttpError as e:
             # Extraer código de estado del error
             status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
@@ -206,7 +225,7 @@ def _retry(call, retries: int = 3, base: float = 1.0):
                 continue
             raise
 
-def _df_to_values(df: pd.DataFrame) -> List[List]:
+def _df_to_values(df: pd.DataFrame, escape_formulas: bool = False) -> List[List]:
     """
     Convierte un DataFrame de pandas a formato de valores para Google Sheets.
     Maneja valores nulos y NaN convirtiéndolos a strings vacíos.
@@ -225,7 +244,7 @@ def _df_to_values(df: pd.DataFrame) -> List[List]:
     # Convertir cada fila del DataFrame
     for row in df.itertuples(index=False, name=None):
         # Manejar valores nulos y NaN
-        clean_row = ["" if (v is None or (isinstance(v, float) and pd.isna(v))) else v for v in row]
+        clean_row = ["" if (v is None or (isinstance(v, float) and pd.isna(v))) else (_sheet_safe(v) if escape_formulas else v) for v in row]
         values.append(clean_row)
     
     return values
@@ -433,7 +452,7 @@ def upsert_google_sheet(
         _retry(lambda: sheets.spreadsheets().values().clear(spreadsheetId=doc["id"], range=current_sheet_name).execute())
     
     # Convertir DataFrame a formato de valores
-    values = _df_to_values(df)
+    values = _df_to_values(df, escape_formulas=value_input_option == "USER_ENTERED")
     body = {"values": values}
     
     # Subir datos a la hoja
@@ -863,6 +882,8 @@ def write_sheet_values_in_batches(
         end_i = min(batch_idx * batch_size, total_rows)
         chunk = df.iloc[start_i:end_i]
         values = chunk.values.tolist()
+        if value_input_option == "USER_ENTERED":
+            values = [[_sheet_safe(v) for v in row] for row in values]
         min_rows_needed = start_row + len(values) - 1
         ensure_sheet_has_rows(sheets, spreadsheet_id, sheet_id, min_rows=min_rows_needed, grow_by_rows=5000)
         log.info("upload_batch %d/%d rows=%d start_row=%d", batch_idx, total_batches, len(values), start_row)
