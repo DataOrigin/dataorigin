@@ -1,4 +1,4 @@
-import os, sys, json, time, logging, re
+import os, sys, json, time, logging, re, random
 from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse, parse_qs
 import datetime  # Needed for timestamp-based sheet names
@@ -189,41 +189,45 @@ def _build_services(scopes: List[str] = SCOPES):
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     return sheets, drive
 
+# Sheets quota is per minute and per user: a 429 needs tens of seconds, not the 1-4 s of a 5xx backoff.
+# Jitter keeps parallel workers sharing one user from retrying in lockstep.
+QUOTA_WAITS = (10, 20, 30, 45, 60)
+
 def _retry(call, retries: int = 3, base: float = 1.0):
     """
-    Implementa reintentos con backoff exponencial para llamadas a la API.
-    Reintenta automáticamente en caso de errores 429 (rate limit), 5xx (server errors) y
-    timeouts o cortes de conexión.
-    
+    Implementa reintentos para llamadas a la API.
+    429 (cuota por minuto): hasta len(QUOTA_WAITS) reintentos con esperas de 10-60 s.
+    5xx, timeouts y cortes de conexión: backoff exponencial corto (base * 2^i).
+
     Args:
         call: Función lambda a ejecutar
-        retries: Número máximo de reintentos
+        retries: Número máximo de reintentos para 5xx/timeouts
         base: Tiempo base en segundos para el backoff
-        
+
     Returns:
         Resultado de la llamada exitosa
-        
+
     Raises:
         HttpError: Si falla después de todos los reintentos
     """
-    for i in range(retries + 1):
-        try: 
+    attempt = quota_attempt = 0
+    while True:
+        try:
             return call()
         except (TimeoutError, ConnectionError):
             # Socket read timeouts / resets on big payloads are transient too.
-            if i < retries:
-                time.sleep(base * (2 ** i))
-                continue
-            raise
+            if attempt >= retries: raise
         except HttpError as e:
-            # Extraer código de estado del error
             status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
-            
-            # Reintentar solo para errores específicos y si quedan reintentos
-            if status in [429, 500, 502, 503, 504] and i < retries:
-                time.sleep(base * (2 ** i))  # Backoff exponencial: 1s, 2s, 4s...
+            if status == 429 and quota_attempt < len(QUOTA_WAITS):
+                wait = QUOTA_WAITS[quota_attempt] + random.uniform(0, 5)
+                logging.warning("Sheets quota hit (429), retry %d/%d in %.0fs", quota_attempt + 1, len(QUOTA_WAITS), wait)
+                time.sleep(wait)
+                quota_attempt += 1
                 continue
-            raise
+            if status not in [500, 502, 503, 504] or attempt >= retries: raise
+        time.sleep(base * (2 ** attempt))
+        attempt += 1
 
 def _df_to_values(df: pd.DataFrame, escape_formulas: bool = False) -> List[List]:
     """
