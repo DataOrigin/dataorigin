@@ -1,6 +1,12 @@
-# DataOrigin Package
+# dataorigin
 
-This package provides core utilities for the DataOrigin project, focusing on leveraging AI-driven data insights for sales prospecting and lead generation in the B2B event space.
+Python utilities used by [DataOrigin](https://dataorigin.es/en/), a trade show prospecting platform. DataOrigin finds the companies exhibiting at European B2B trade shows and ranks them by your Ideal Customer Profile.
+
+This package holds the helpers shared by our data pipelines. Today it covers reading and writing Google Sheets with pandas, with retries for the Sheets API quotas.
+
+- Website: https://dataorigin.es/en/
+- PyPI: https://pypi.org/project/dataorigin/
+- Trade show calendar: https://dataorigin.es/en/trade-show-calendar/
 
 ## Installation
 
